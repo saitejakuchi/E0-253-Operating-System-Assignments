@@ -1,0 +1,986 @@
+From dc4503a6797c99f844b87fcd24dc654043330ece Mon Sep 17 00:00:00 2001
+From: Teja <teja@mail.com>
+Date: Tue, 28 Feb 2023 20:18:39 +053
+Subject: [PATCH] Assignment-1
+
+---
+ Makefile                               |   2 +-
+ arch/x86/entry/syscalls/syscall_64.tbl |   1 +
+ include/asm-generic/vmlinux.lds.h      |   1 +
+ include/linux/sched.h                  |   7 +
+ include/linux/syscalls.h               |   1 +
+ include/uapi/linux/sched.h             |   2 +-
+ kernel/sched/build_policy.c            |   1 +
+ kernel/sched/core.c                    |  26 +-
+ kernel/sched/rsdl.c                    | 541 +++++++++++++++++++++++++
+ kernel/sched/sched.h                   |  41 ++
+ rsdl_schedule/Makefile                 |   1 +
+ rsdl_schedule/rsdl_schedule.c          |  72 ++++
+ rsdl_schedule/rsdl_schedule.h          |   7 +
+ 13 files changed, 693 insertions(+), 10 deletions(-)
+ create mode 100644 kernel/sched/rsdl.c
+ create mode 100644 rsdl_schedule/Makefile
+ create mode 100644 rsdl_schedule/rsdl_schedule.c
+ create mode 100644 rsdl_schedule/rsdl_schedule.h
+
+diff --git a/Makefile b/Makefile
+index b978809a1..186183a60 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1101,7 +1101,7 @@ export MODORDER := $(extmod_prefix)modules.order
+ export MODULES_NSDEPS := $(extmod_prefix)modules.nsdeps
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y			+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/
++core-y			+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ rsdl_schedule/
+ core-$(CONFIG_BLOCK)	+= block/
+ core-$(CONFIG_IO_URING)	+= io_uring/
+ 
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index c84d12608..ea73d48c3 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -415,5 +415,6 @@
+ 545	x32	execveat		compat_sys_execveat
+ 546	x32	preadv2			compat_sys_preadv64v2
+ 547	x32	pwritev2		compat_sys_pwritev64v2
++548	common	isolate_core		sys_isolate_core
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+ # not special and are not to be used for x32-specific syscalls.
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 594422890..f1d72b364 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -130,6 +130,7 @@
+ 	*(__stop_sched_class)			\
+ 	*(__dl_sched_class)			\
+ 	*(__rt_sched_class)			\
++	*(__rsdl_sched_class)			\
+ 	*(__fair_sched_class)			\
+ 	*(__idle_sched_class)			\
+ 	__sched_class_lowest = .;
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 8d82d6d32..f945db97b 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -588,6 +588,12 @@ struct sched_rt_entity {
+ #endif
+ } __randomize_layout;
+ 
++struct sched_rsdl_entity {
++	struct rsdl_sched_node *	run_list;
++	unsigned int 			task_timeleft;
++	unsigned short 			on_rq;
++};
++
+ struct sched_dl_entity {
+ 	struct rb_node			rb_node;
+ 
+@@ -778,6 +784,7 @@ struct task_struct {
+ 	struct sched_entity		se;
+ 	struct sched_rt_entity		rt;
+ 	struct sched_dl_entity		dl;
++	struct sched_rsdl_entity	rsdl_en;
+ 	const struct sched_class	*sched_class;
+ 
+ #ifdef CONFIG_SCHED_CORE
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index a34b0f9a9..6aa546cb2 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1385,4 +1385,5 @@ int __sys_getsockopt(int fd, int level, int optname, char __user *optval,
+ 		int __user *optlen);
+ int __sys_setsockopt(int fd, int level, int optname, char __user *optval,
+ 		int optlen);
++asmlinkage int sys_isolate_core(int core_id);
+ #endif
+diff --git a/include/uapi/linux/sched.h b/include/uapi/linux/sched.h
+index 3bac0a8ce..bea9efe19 100644
+--- a/include/uapi/linux/sched.h
++++ b/include/uapi/linux/sched.h
+@@ -118,7 +118,7 @@ struct clone_args {
+ /* SCHED_ISO: reserved but not implemented yet */
+ #define SCHED_IDLE		5
+ #define SCHED_DEADLINE		6
+-
++#define SCHED_RSDL		7
+ /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
+ #define SCHED_RESET_ON_FORK     0x40000000
+ 
+diff --git a/kernel/sched/build_policy.c b/kernel/sched/build_policy.c
+index d9dc9ab37..292db85b2 100644
+--- a/kernel/sched/build_policy.c
++++ b/kernel/sched/build_policy.c
+@@ -43,6 +43,7 @@
+ #include "idle.c"
+ 
+ #include "rt.c"
++#include "rsdl.c"
+ 
+ #ifdef CONFIG_SMP
+ # include "cpudeadline.c"
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index cb9d8ae7c..b7416c127 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -6,6 +6,7 @@
+  *
+  *  Copyright (C) 1991-2002  Linus Torvalds
+  */
++#include "linux/sched/prio.h"
+ #include <linux/highmem.h>
+ #include <linux/hrtimer_api.h>
+ #include <linux/ktime_api.h>
+@@ -2108,6 +2109,8 @@ static inline int __normal_prio(int policy, int rt_prio, int nice)
+ 		prio = MAX_DL_PRIO - 1;
+ 	else if (rt_policy(policy))
+ 		prio = MAX_RT_PRIO - 1 - rt_prio;
++	else if(rsdl_policy(policy))
++		prio = NICE_TO_PRIO(nice);
+ 	else
+ 		prio = NICE_TO_PRIO(nice);
+ 
+@@ -5800,11 +5803,13 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 	 */
+ 	if (likely(!sched_class_above(prev->sched_class, &fair_sched_class) &&
+ 		   rq->nr_running == rq->cfs.h_nr_running)) {
+-
+-		p = pick_next_task_fair(rq, prev, rf);
+-		if (unlikely(p == RETRY_TASK))
+-			goto restart;
+-
++		if(fair_policy(prev->policy)) {
++			p = pick_next_task_fair(rq, prev, rf);
++			if (unlikely(p == RETRY_TASK))
++				goto restart;
++		} else {
++			p = pick_next_task_rsdl(rq);
++		}
+ 		/* Assume the next prioritized class is idle_sched_class */
+ 		if (!p) {
+ 			put_prev_task(rq, prev);
+@@ -7005,7 +7010,7 @@ void set_user_nice(struct task_struct *p, long nice)
+ 	 * it won't have any effect on scheduling until the task is
+ 	 * SCHED_DEADLINE, SCHED_FIFO or SCHED_RR:
+ 	 */
+-	if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
++	if (task_has_dl_policy(p) || task_has_rt_policy(p) || task_has_rsdl_policy(p)) {
+ 		p->static_prio = NICE_TO_PRIO(nice);
+ 		goto out_unlock;
+ 	}
+@@ -7311,6 +7316,8 @@ static void __setscheduler_params(struct task_struct *p,
+ 
+ 	if (dl_policy(policy))
+ 		__setparam_dl(p, attr);
++	else if(rsdl_policy(policy))
++		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+ 	else if (fair_policy(policy))
+ 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+ 
+@@ -9564,6 +9571,7 @@ void __init sched_init_smp(void)
+ 
+ 	init_sched_rt_class();
+ 	init_sched_dl_class();
++	init_sched_rsdl_class();
+ 
+ 	sched_smp_initialized = true;
+ }
+@@ -9611,7 +9619,8 @@ void __init sched_init(void)
+ 
+ 	/* Make sure the linker didn't screw up */
+ 	BUG_ON(&idle_sched_class != &fair_sched_class + 1 ||
+-	       &fair_sched_class != &rt_sched_class + 1 ||
++	       &fair_sched_class != &rsdl_sched_class + 1 ||
++	       &rsdl_sched_class != &rt_sched_class + 1   ||
+ 	       &rt_sched_class   != &dl_sched_class + 1);
+ #ifdef CONFIG_SMP
+ 	BUG_ON(&dl_sched_class != &stop_sched_class + 1);
+@@ -9687,6 +9696,7 @@ void __init sched_init(void)
+ 		init_cfs_rq(&rq->cfs);
+ 		init_rt_rq(&rq->rt);
+ 		init_dl_rq(&rq->dl);
++		init_rsdl_rq(&rq->rsdl);
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
+ 		rq->tmp_alone_branch = &rq->leaf_cfs_rq_list;
+@@ -9792,7 +9802,7 @@ void __init sched_init(void)
+ 	balance_push_set(smp_processor_id(), false);
+ #endif
+ 	init_sched_fair_class();
+-
++	init_sched_rsdl_class();
+ 	psi_init();
+ 
+ 	init_uclamp();
+diff --git a/kernel/sched/rsdl.c b/kernel/sched/rsdl.c
+new file mode 100644
+index 000000000..dd4ff8879
+--- /dev/null
++++ b/kernel/sched/rsdl.c
+@@ -0,0 +1,541 @@
++#include <linux/cpumask_api.h>
++#include <linux/energy_model.h>
++#include <linux/highmem.h>
++#include <linux/hugetlb_inline.h>
++#include <linux/jiffies.h>
++#include <linux/lockdep_api.h>
++#include <linux/mm_api.h>
++#include <linux/mmap_lock.h>
++#include <linux/refcount_api.h>
++#include <linux/sched/clock.h>
++#include <linux/sched/cond_resched.h>
++#include <linux/sched/cputime.h>
++#include <linux/sched/isolation.h>
++#include <linux/sched/nohz.h>
++#include <linux/softirq.h>
++#include <linux/spinlock_api.h>
++#include <linux/topology.h>
++
++#include <linux/cpuidle.h>
++#include <linux/interrupt.h>
++#include <linux/mempolicy.h>
++#include <linux/mutex_api.h>
++#include <linux/profile.h>
++#include <linux/psi.h>
++#include <linux/ratelimit.h>
++#include <linux/task_work.h>
++
++#include <asm/switch_to.h>
++
++#include <linux/sched/cond_resched.h>
++
++#include "autogroup.h"
++#include "linux/sched.h"
++#include "linux/sched/prio.h"
++#include "linux/stddef.h"
++#include "sched.h"
++#include "stats.h"
++
++#define PRIO_TO_INDEX(prio) prio - 100
++#define DEFAULT_QUEUE_TIMESLICE 20
++#define DEFAULT_TASK_TIMESLICE 5
++
++const struct sched_class rsdl_sched_class;
++
++__init void init_sched_rsdl_class(void) {}
++
++// TODO (future optimization.) :- Implement an LL using queue and use it instead
++// of manually changing the link. Ideally should use list_head provided by linux
++// but as this is assignment it's not allowed.
++
++void init_rsdl_rq(struct rsdl_rq *rq_rsdl) {
++  // Initializing everything to proper values.
++  rq_rsdl->rsdl_nr_running = 0;
++  rq_rsdl->curr_running_prio = 0;
++
++  for (int index = 0; index < NICE_WIDTH + 1; ++index) {
++    rq_rsdl->running_data[index].head = NULL;
++    rq_rsdl->running_data[index].tail = NULL;
++    rq_rsdl->running_data[index].queue_timeleft = DEFAULT_QUEUE_TIMESLICE;
++    rq_rsdl->running_data[index].prio_nr_running = 0;
++
++    rq_rsdl->expired_data[index].head = NULL;
++    rq_rsdl->expired_data[index].tail = NULL;
++    rq_rsdl->expired_data[index].queue_timeleft = 0;
++    rq_rsdl->expired_data[index].prio_nr_running = 0;
++  }
++
++  rq_rsdl->active = rq_rsdl->running_data;
++  rq_rsdl->expired = rq_rsdl->expired_data;
++}
++
++static void enqueue_task_rsdl(struct rq *rq, struct task_struct *p, int flags) {
++  struct sched_rsdl_entity *rsdl_se;
++  struct rsdl_rq *rq_rsdl;
++  struct rsdl_prio_array *rsdl_prio_array_data;
++  int curr_prio_index, prio_index;
++  struct rsdl_sched_node *task_node, *sched_head_data;
++
++  rsdl_se = &p->rsdl_en;
++  rq_rsdl = &rq->rsdl;
++  prio_index = PRIO_TO_INDEX(p->static_prio);
++
++  // If already on ready-queue return
++  if (rsdl_se->on_rq) {
++    return;
++  }
++
++  // If already running return
++  if (!task_is_running(p)) {
++    return;
++  }
++
++  // Add it to the sched entity.
++  rsdl_se->on_rq = true;
++  rsdl_se->task_timeleft = DEFAULT_TASK_TIMESLICE;
++  rq_rsdl->rsdl_nr_running++;
++
++  // Figuring out the head of index array to enqueue the new task based on it's
++  // priority and current_priority running value.
++  curr_prio_index = rq_rsdl->curr_running_prio;
++  if (curr_prio_index > prio_index) {
++    rsdl_prio_array_data = &rq_rsdl->active[curr_prio_index];
++  } else {
++    rsdl_prio_array_data = &rq_rsdl->active[prio_index];
++  }
++
++  // Create new rsdl_sched_node to insert into that prioirty slot value.
++  task_node = kmalloc(sizeof(struct rsdl_sched_node), GFP_KERNEL);
++  task_node->next = NULL;
++  task_node->task_scheded = p;
++  sched_head_data = rsdl_prio_array_data->head;
++
++  // Inserting into proper slot.
++  if (sched_head_data == NULL) {
++    rsdl_prio_array_data->head = task_node;
++  } else {
++    rsdl_prio_array_data->tail->next = task_node;
++  }
++  rsdl_prio_array_data->tail = task_node;
++  // Incrementing the number of tasks in the current priority index. (different
++  // from all nr_running.)
++  rsdl_prio_array_data->prio_nr_running++;
++}
++
++static void dequeue_task_rsdl(struct rq *rq, struct task_struct *p, int flags) {
++  struct sched_rsdl_entity *rsdl_se;
++  struct rsdl_rq *rq_rsdl;
++  struct rsdl_prio_array *rsdl_prio_array_data;
++  int prio_index;
++  bool task_found;
++  struct rsdl_sched_node *task_data, *prev;
++
++  rsdl_se = &p->rsdl_en;
++  rq_rsdl = &rq->rsdl;
++  prio_index = rq_rsdl->curr_running_prio;
++  task_found = false;
++
++  while (!task_found) {
++    // Since the task got scheduled and went to a different index altogether
++    // need to search where it's from the current_running_prio_value.
++    rsdl_prio_array_data = &rq_rsdl->active[prio_index];
++    task_data = rsdl_prio_array_data->head;
++    prev = NULL;
++    while (task_data->next != NULL) {
++      if (task_data->task_scheded == p) {
++        task_found = true;
++        break;
++      }
++      prev = task_data;
++      task_data = task_data->next;
++    }
++
++    if (task_found) {
++      if (prev == NULL) {
++        // Handles the cases of deleting head node.
++        if ((rsdl_prio_array_data->head != rsdl_prio_array_data->tail)) {
++          // There are more than 1 sched_task nodes
++          rsdl_prio_array_data->head = rsdl_prio_array_data->head->next;
++        } else {
++          // Exactly 1 sched_task node which is head.
++          rsdl_prio_array_data->head = NULL;
++          rsdl_prio_array_data->tail = NULL;
++        }
++      } else {
++        if (task_data == rsdl_prio_array_data->tail) {
++          // Deleting tail node
++          prev->next = NULL;
++          rsdl_prio_array_data->tail = prev;
++        } else {
++          // Deleting middle node.
++          prev->next = task_data->next;
++        }
++      }
++
++      kfree(task_data);
++      rsdl_prio_array_data->prio_nr_running--;
++      rq_rsdl->rsdl_nr_running--;
++      rsdl_se->on_rq = false;
++    } else {
++      // Search the task in next prioirty array data.
++      prio_index++;
++    }
++  }
++}
++
++static void yield_task_rsdl(struct rq *rq) {
++  // Encoutered a task with sleep or IO, move it to the end and proceed with
++  // next task if there is any
++  struct rsdl_rq *rq_rsdl;
++  int curr_prio;
++  struct task_struct *task;
++  struct sched_rsdl_entity *rsdl_se;
++  struct rsdl_prio_array *next_array;
++  struct rsdl_sched_node *temp;
++
++  rq_rsdl = &rq->rsdl;
++  curr_prio = rq_rsdl->curr_running_prio;
++
++  if (curr_prio == (NICE_WIDTH - 1))
++    return;
++
++  if (rq_rsdl->active[curr_prio].prio_nr_running == 1) {
++    // If only 1 element is present in that priority queue
++    task = rq_rsdl->active[curr_prio].head->task_scheded;
++    rsdl_se = &task->rsdl_en;
++
++    // Move it from current priority to next priority queue tail and add it's
++    // left over time_value.
++    next_array = &rq_rsdl->active[curr_prio + 1];
++
++    next_array->tail->next = rq_rsdl->active[curr_prio].head;
++    next_array->tail = rq_rsdl->active[curr_prio].head;
++    rq_rsdl->active[curr_prio].head = NULL;
++    rq_rsdl->active[curr_prio].tail = NULL;
++    rsdl_se->task_timeleft += DEFAULT_TASK_TIMESLICE;
++
++  } else {
++    temp = rq_rsdl->active[curr_prio].head;
++
++    // Move the current yielding task to end of the current prioirty queue by
++    // changing the next, head and tail ptrs.
++    rq_rsdl->active[curr_prio].tail->next = rq_rsdl->active[curr_prio].head;
++    rq_rsdl->active[curr_prio].head = rq_rsdl->active[curr_prio].head->next;
++    temp->next = NULL;
++  }
++}
++
++static bool yield_to_task_rsdl(struct rq *rq, struct task_struct *p) {
++  return false;
++}
++
++static void reset_scheduling(struct rq *rq) {
++  struct rsdl_rq *rq_rsdl = &rq->rsdl;
++  // Resetting everything to NULL and default queue-time slices.
++  init_rsdl_rq(rq_rsdl);
++}
++
++static void reset_prio_array(struct rq *rq) {
++  struct rsdl_rq *rq_rsdl;
++  int current_prio_index;
++  struct rsdl_prio_array *rsdl_array_data, *rsdl_final_expired_data,
++      *rsdl_expired_data, *temp_array;
++  struct rsdl_sched_node *currn_node, *temp;
++  int insert_index;
++
++  rq_rsdl = &rq->rsdl;
++  current_prio_index = NICE_WIDTH + 1;
++  rsdl_array_data = &rq_rsdl->active[current_prio_index];
++  currn_node = rsdl_array_data->head;
++
++  // Moving data from index 40 to expired_data for swapping.
++  while (currn_node->next != NULL) {
++    insert_index = PRIO_TO_INDEX(currn_node->task_scheded->static_prio);
++    temp = currn_node;
++
++    rsdl_expired_data = &rq_rsdl->expired[insert_index];
++    if (rsdl_expired_data->head == NULL) {
++      rsdl_expired_data->head = currn_node;
++      rsdl_expired_data->tail = currn_node;
++
++    } else {
++      rsdl_expired_data->tail->next = currn_node;
++      rsdl_expired_data->tail = currn_node;
++    }
++    currn_node = currn_node->next;
++    temp->next = NULL;
++  }
++  // Move the final element aswell.
++  insert_index = PRIO_TO_INDEX(currn_node->task_scheded->static_prio);
++  rsdl_final_expired_data = &rq_rsdl->expired[insert_index];
++  if (rsdl_final_expired_data->head == NULL) {
++    rsdl_final_expired_data->head = currn_node;
++    rsdl_final_expired_data->tail = currn_node;
++
++  } else {
++    rsdl_final_expired_data->tail->next = currn_node;
++    rsdl_final_expired_data->tail = currn_node;
++  }
++  currn_node->next = NULL;
++
++  temp_array = rq_rsdl->active;
++  rq_rsdl->active = rq_rsdl->expired;
++  rq_rsdl->expired = temp_array;
++
++  // Resetting values in expired array for future use.
++  for (int index = 0; index < NICE_WIDTH; index++) {
++    rq_rsdl->expired[index].queue_timeleft = 0;
++    rq_rsdl->expired[index].head = NULL;
++    rq_rsdl->expired[index].tail = NULL;
++    rq_rsdl->expired[index].prio_nr_running = 0;
++  }
++}
++
++struct task_struct *pick_next_task_rsdl(struct rq *rq) {
++  struct rsdl_rq *rq_rsdl;
++  struct task_struct *result_struct;
++  bool task_found;
++  int curr_prio_index;
++  struct rsdl_sched_node *node_data;
++
++  rq_rsdl = &rq->rsdl;
++  task_found = false;
++  // No more tasks left.
++  if (rq_rsdl->rsdl_nr_running == 0) {
++    reset_scheduling(rq);
++    return NULL;
++  }
++
++  curr_prio_index = rq_rsdl->curr_running_prio;
++  // Get the prio index of queue with schedualable tasks.
++  while (curr_prio_index < NICE_WIDTH &&
++         (rq_rsdl->active[curr_prio_index].head == NULL)) {
++    ++curr_prio_index;
++  }
++
++  // No scheduable tasks? Reset.
++  if (curr_prio_index == NICE_WIDTH) {
++    reset_prio_array(rq);
++  }
++
++  // From the new prio queue, finding a runnable task and return.
++  curr_prio_index = 0;
++  while (curr_prio_index < NICE_WIDTH) {
++    if (rq_rsdl->active[curr_prio_index].head == NULL) {
++      curr_prio_index++;
++      continue;
++    } else {
++      node_data = rq_rsdl->active[curr_prio_index].head;
++      while (node_data->next != NULL) {
++        if (task_is_running(node_data->task_scheded)) {
++          result_struct = node_data->task_scheded;
++          task_found = true;
++          break;
++        }
++        node_data = node_data->next;
++      }
++      if (task_found)
++        break;
++      if (task_is_running(node_data->task_scheded)) {
++        result_struct = node_data->task_scheded;
++        break;
++      }
++      // No running tasks, go to the next priorty index value to find suitable
++      // task.
++      curr_prio_index++;
++      continue;
++    }
++  }
++  return result_struct;
++}
++
++static void set_next_task_rsdl(struct rq *rq, struct task_struct *p,
++                               bool first) {
++  struct sched_rsdl_entity *rsdl_se = &p->rsdl_en;
++  rq->curr = pick_next_task_rsdl(rq);
++  // Not sure of below.
++  rsdl_se->task_timeleft = DEFAULT_TASK_TIMESLICE;
++  rsdl_se->on_rq = true;
++}
++
++static void put_prev_task_rsdl(struct rq *rq, struct task_struct *p) {}
++
++static void task_tick_rsdl(struct rq *rq, struct task_struct *p, int queued) {
++  struct sched_rsdl_entity *rsdl_se;
++  struct rsdl_rq *rq_rsdl;
++  int curr_prio_value;
++  struct rsdl_prio_array *rsdl_next_running_arr, *rsdl_curr_running_arr;
++  struct rsdl_sched_node *curr_node, *temp, *nodes_data;
++
++  rsdl_se = &p->rsdl_en;
++  rq_rsdl = &rq->rsdl;
++  curr_prio_value = rq_rsdl->curr_running_prio;
++  rsdl_curr_running_arr = &rq_rsdl->active[curr_prio_value];
++  rsdl_next_running_arr = &rq_rsdl->active[curr_prio_value + 1];
++  curr_node = rsdl_curr_running_arr->head;
++
++  if (!rsdl_se->task_timeleft || !rsdl_curr_running_arr->queue_timeleft) {
++    // Either the task time quote or priority queue quote got exhuasted,
++    // reschedule
++    if (rsdl_se->task_timeleft == 0) {
++
++      // Find the node within the prio queue.
++      while (curr_node->task_scheded != p) {
++        curr_node = curr_node->next;
++      }
++
++      rsdl_next_running_arr->prio_nr_running++;
++      rsdl_curr_running_arr->prio_nr_running--;
++
++      // Moving task node from 1 prio queue index to another making sure to
++      // handling all edge cases.
++      if (rsdl_next_running_arr->tail == NULL) {
++        rsdl_next_running_arr->head = rsdl_next_running_arr->tail = curr_node;
++        if (rsdl_curr_running_arr->prio_nr_running == 1) {
++          rsdl_curr_running_arr->head = rsdl_curr_running_arr->tail = NULL;
++        } else {
++          rsdl_curr_running_arr->head = curr_node->next;
++        }
++        curr_node->next = NULL;
++      } else {
++        rsdl_next_running_arr->tail->next = curr_node;
++        rsdl_next_running_arr->tail = curr_node;
++        if (rsdl_curr_running_arr->prio_nr_running == 1) {
++          rsdl_curr_running_arr->head = rsdl_curr_running_arr->tail = NULL;
++        } else {
++          rsdl_curr_running_arr->head = curr_node->next;
++        }
++        curr_node->next = NULL;
++      }
++      // Successfully moved to next prioirty value, hence replenishing the
++      // timeslice value.
++      rsdl_se->task_timeleft = DEFAULT_TASK_TIMESLICE;
++    }
++
++    if (rsdl_curr_running_arr->queue_timeleft == 0) {
++      // There are tasks that needs to be moved to the next prio index value.
++      if (rsdl_curr_running_arr->head != NULL) {
++        nodes_data = rsdl_curr_running_arr->head;
++        while (nodes_data->next != NULL) {
++          temp = nodes_data;
++          if (rsdl_next_running_arr->tail == NULL) {
++            rsdl_next_running_arr->head = rsdl_next_running_arr->tail =
++                nodes_data;
++          } else {
++            rsdl_curr_running_arr->tail->next = nodes_data;
++            rsdl_curr_running_arr->tail = nodes_data;
++          }
++          nodes_data = nodes_data->next;
++          temp->next = NULL;
++        }
++        // move the final node also to the tail end of the list.
++        if (rsdl_next_running_arr->tail == NULL) {
++          rsdl_next_running_arr->head = rsdl_next_running_arr->tail =
++              nodes_data;
++          nodes_data->next = NULL;
++        } else {
++          rsdl_curr_running_arr->tail->next = nodes_data;
++          rsdl_curr_running_arr->tail = nodes_data;
++          nodes_data->next = NULL;
++        }
++      }
++    }
++    resched_curr(rq);
++  } else {
++    --rsdl_se->task_timeleft;
++    --rsdl_curr_running_arr->queue_timeleft;
++  }
++}
++
++static void prio_changed_rsdl(struct rq *rq, struct task_struct *p,
++                              int oldprio) {
++
++  if (!task_on_rq_queued(p))
++    return;
++
++  if ((rq->curr == p) && (p->prio != oldprio)) {
++    resched_curr(rq);
++  }
++}
++
++static void task_woken_rsdl(struct rq *rq, struct task_struct *p) {
++  struct sched_rsdl_entity *rsdl_se = &p->rsdl_en;
++  if (!rsdl_se->on_rq) {
++    enqueue_task_rsdl(rq, p, ENQUEUE_WAKEUP);
++  }
++}
++
++static int balance_rsdl(struct rq *rq, struct task_struct *prev,
++                        struct rq_flags *rf) {
++  // TODO :- Use the variable from the rsdl_schedule by making it extern
++  // instead?
++  return rq->cpu;
++}
++
++static struct task_struct *pick_task_rsdl(struct rq *rq) {
++  return pick_next_task_rsdl(rq);
++}
++
++static int select_task_rq_rsdl(struct task_struct *p, int prev_cpu, int flags) {
++  return prev_cpu;
++}
++
++static void task_dead_rsdl(struct task_struct *p) {
++  // Handles case where task is done.
++  struct sched_rsdl_entity *rsdl_se = &p->rsdl_en;
++  rsdl_se->task_timeleft = 0;
++  rsdl_se->on_rq = false;
++}
++
++static void rq_online_rsdl(struct rq *rq) {}
++
++static void rq_offline_rsdl(struct rq *rq) {}
++
++static void switched_from_rsdl(struct rq *this_rq, struct task_struct *task) {}
++
++static unsigned int get_rr_interval_rsdl(struct rq *rq,
++                                         struct task_struct *task) {
++  return DEFAULT_TASK_TIMESLICE;
++}
++
++static void switched_to_rsdl(struct rq *rq, struct task_struct *p) {}
++
++static void update_curr_rsdl(struct rq *rq) {}
++
++static void check_preempt_curr_rsdl(struct rq *rq, struct task_struct *p,
++                                    int flags) {}
++
++// Using Functions defined in rt class.
++DEFINE_SCHED_CLASS(rsdl) = {
++
++    .enqueue_task = enqueue_task_rsdl,
++    .dequeue_task = dequeue_task_rsdl,
++    .yield_task = yield_task_rsdl,
++    .yield_to_task = yield_to_task_rsdl,
++    .pick_next_task = pick_next_task_rsdl,
++    .set_next_task = set_next_task_rsdl,
++    .put_prev_task = put_prev_task_rsdl,
++    .task_tick = task_tick_rsdl,
++    .prio_changed = prio_changed_rsdl,
++
++#ifdef CONFIG_SMP
++    .task_woken = task_woken_rsdl,
++    .balance = balance_rsdl,
++    .pick_task = pick_task_rsdl,
++    .select_task_rq = select_task_rq_rsdl,
++    .task_dead = task_dead_rsdl,
++    .set_cpus_allowed = set_cpus_allowed_common,
++    .rq_online = rq_online_rsdl,
++    .rq_offline = rq_offline_rsdl,
++    .switched_from = switched_from_rsdl,
++#endif
++
++    .get_rr_interval = get_rr_interval_rsdl,
++    .switched_to = switched_to_rsdl,
++    .update_curr = update_curr_rsdl,
++    .check_preempt_curr = check_preempt_curr_rsdl,
++
++#ifdef CONFIG_UCLAMP_TASK
++    .uclamp_enabled = 1,
++#endif
++};
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 2fcb7eb56..6e44254b3 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -73,6 +73,7 @@
+ #include <trace/events/sched.h>
+ 
+ #include "../workqueue_internal.h"
++#include "linux/sched/prio.h"
+ 
+ #ifdef CONFIG_CGROUP_SCHED
+ #include <linux/cgroup.h>
+@@ -192,6 +193,11 @@ static inline int rt_policy(int policy)
+ 	return policy == SCHED_FIFO || policy == SCHED_RR;
+ }
+ 
++static inline int rsdl_policy(int policy)
++{
++	return policy == SCHED_RSDL;
++}
++
+ static inline int dl_policy(int policy)
+ {
+ 	return policy == SCHED_DEADLINE;
+@@ -199,6 +205,7 @@ static inline int dl_policy(int policy)
+ static inline bool valid_policy(int policy)
+ {
+ 	return idle_policy(policy) || fair_policy(policy) ||
++		rsdl_policy(policy) ||
+ 		rt_policy(policy) || dl_policy(policy);
+ }
+ 
+@@ -217,6 +224,10 @@ static inline int task_has_dl_policy(struct task_struct *p)
+ 	return dl_policy(p->policy);
+ }
+ 
++static inline int task_has_rsdl_policy(struct task_struct *p) {
++	return rsdl_policy(p->policy);
++}
++
+ #define cap_scale(v, s) ((v)*(s) >> SCHED_CAPACITY_SHIFT)
+ 
+ static inline void update_avg(u64 *avg, u64 sample)
+@@ -710,6 +721,26 @@ struct rt_rq {
+ #endif
+ };
+ 
++struct rsdl_sched_node {
++	struct rsdl_sched_node *next;
++	struct task_struct *task_scheded;
++};
++
++struct rsdl_prio_array {
++	struct rsdl_sched_node *head, *tail;
++	unsigned int 		queue_timeleft;
++	unsigned int		prio_nr_running;
++};
++
++struct rsdl_rq {
++
++	struct rsdl_prio_array *active, *expired;
++	struct rsdl_prio_array running_data[NICE_WIDTH + 1], expired_data[NICE_WIDTH + 1];
++
++	unsigned int		curr_running_prio;
++	unsigned int	        rsdl_nr_running;
++};
++
+ static inline bool rt_rq_is_runnable(struct rt_rq *rt_rq)
+ {
+ 	return rt_rq->rt_queued && rt_rq->rt_nr_running;
+@@ -999,6 +1030,7 @@ struct rq {
+ 	struct cfs_rq		cfs;
+ 	struct rt_rq		rt;
+ 	struct dl_rq		dl;
++	struct rsdl_rq	        rsdl;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/* list of leaf cfs_rq on this CPU: */
+@@ -2259,6 +2291,7 @@ extern struct sched_class __sched_class_lowest[];
+ extern const struct sched_class stop_sched_class;
+ extern const struct sched_class dl_sched_class;
+ extern const struct sched_class rt_sched_class;
++extern const struct sched_class rsdl_sched_class;
+ extern const struct sched_class fair_sched_class;
+ extern const struct sched_class idle_sched_class;
+ 
+@@ -2272,6 +2305,11 @@ static inline bool sched_dl_runnable(struct rq *rq)
+ 	return rq->dl.dl_nr_running > 0;
+ }
+ 
++static inline bool sched_rsdl_runnable(struct rq *rq)
++{
++	return rq->rsdl.rsdl_nr_running > 0;
++}
++
+ static inline bool sched_rt_runnable(struct rq *rq)
+ {
+ 	return rq->rt.rt_queued > 0;
+@@ -2284,6 +2322,7 @@ static inline bool sched_fair_runnable(struct rq *rq)
+ 
+ extern struct task_struct *pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf);
+ extern struct task_struct *pick_next_task_idle(struct rq *rq);
++extern struct task_struct *pick_next_task_rsdl(struct rq *rq);
+ 
+ #define SCA_CHECK		0x01
+ #define SCA_MIGRATE_DISABLE	0x02
+@@ -2355,6 +2394,7 @@ extern void update_max_interval(void);
+ extern void init_sched_dl_class(void);
+ extern void init_sched_rt_class(void);
+ extern void init_sched_fair_class(void);
++extern void init_sched_rsdl_class(void);
+ 
+ extern void reweight_task(struct task_struct *p, int prio);
+ 
+@@ -2766,6 +2806,7 @@ static inline void resched_latency_warn(int cpu, u64 latency) {}
+ extern void init_cfs_rq(struct cfs_rq *cfs_rq);
+ extern void init_rt_rq(struct rt_rq *rt_rq);
+ extern void init_dl_rq(struct dl_rq *dl_rq);
++extern void init_rsdl_rq(struct rsdl_rq *rsdl_rq);
+ 
+ extern void cfs_bandwidth_usage_inc(void);
+ extern void cfs_bandwidth_usage_dec(void);
+diff --git a/rsdl_schedule/Makefile b/rsdl_schedule/Makefile
+new file mode 100644
+index 000000000..e3ff4fcd2
+--- /dev/null
++++ b/rsdl_schedule/Makefile
+@@ -0,0 +1 @@
++obj-y := rsdl_schedule.o
+\ No newline at end of file
+diff --git a/rsdl_schedule/rsdl_schedule.c b/rsdl_schedule/rsdl_schedule.c
+new file mode 100644
+index 000000000..38360aa13
+--- /dev/null
++++ b/rsdl_schedule/rsdl_schedule.c
+@@ -0,0 +1,72 @@
++#include "asm/current.h"
++#include "linux/cpu.h"
++#include "linux/cpumask.h"
++#include "linux/cpuset.h"
++#include "linux/kern_levels.h"
++#include "linux/printk.h"
++#include "linux/sched.h"
++#include "linux/sched/signal.h"
++#include "linux/uaccess.h"
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++
++#include "rsdl_schedule.h"
++
++int validate_core_number(int cpu) {
++  int retval;
++  if ((cpu < 0) || (cpu >= num_possible_cpus())) {
++    retval = -1;
++    goto out;
++  }
++  retval = 0;
++out:
++  return retval;
++}
++
++/**
++ * sys_isolate_core - Isolate a cpu core.
++   @core_id -> CPU Core Id (0-# of CPUs) to isolate.
++ * Return: 0 on success. An error code otherwise.
++ */
++SYSCALL_DEFINE1(isolate_core, int __user, core_id)
++
++{
++  int ret_val = 0;
++  struct task_struct *task_data;
++  pid_t task_id;
++  const struct cpumask *isolate_core_mask;
++  cpumask_t updated_task_cpumask;
++
++  if (isolated_core_value != -1) {
++    ret_val = 0;
++    goto out;
++  }
++
++  ret_val = validate_core_number(core_id);
++  if (ret_val)
++    goto out;
++
++  isolated_core_value = core_id;
++  isolate_core_mask = cpumask_of(isolated_core_value);
++
++  for_each_process(task_data) {
++    task_id = task_data->pid;
++    cpumask_andnot(&updated_task_cpumask, &task_data->cpus_mask,
++                   isolate_core_mask);
++    if (cpumask_empty(&updated_task_cpumask)) {
++      // Schedule on next possible cpu in circular fashion.
++      cpumask_set_cpu((1 + isolated_core_value) % num_possible_cpus(),
++                      &updated_task_cpumask);
++    }
++    //     printk("For Process (%d), Old task Mask :- %*pbl, New task Mask
++    //     :-%*pbl\n ",
++    //            task_data->pid, cpumask_pr_args(&task_data->cpus_mask),
++    //            cpumask_pr_args(&updated_task_cpumask));
++    sched_setaffinity(task_id, &updated_task_cpumask);
++    // Wake the sleeping process and migrate them to a different CPU altogether.
++    wake_up_process(task_data);
++  }
++  ret_val = 0;
++out:
++  return ret_val;
++}
+diff --git a/rsdl_schedule/rsdl_schedule.h b/rsdl_schedule/rsdl_schedule.h
+new file mode 100644
+index 000000000..ed986269d
+--- /dev/null
++++ b/rsdl_schedule/rsdl_schedule.h
+@@ -0,0 +1,7 @@
++#ifndef RSDL_SCHED_H
++#define RSDL_SCHED_H
++
++#include "linux/types.h"
++int isolated_core_value = -1;
++
++#endif
+\ No newline at end of file
+-- 
+2.34.1
+

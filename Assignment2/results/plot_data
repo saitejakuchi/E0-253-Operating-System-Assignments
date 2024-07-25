@@ -1,0 +1,116 @@
+Index = 1
+Baseline(fork) Throughput:           2086
+Optimized(context) Throughput:      138614
+Speedup:                            66.44
+Index = 2
+Baseline(fork) Throughput:           2082
+Optimized(context) Throughput:      131997
+Speedup:                            63.37
+Index = 3
+Baseline(fork) Throughput:           2023
+Optimized(context) Throughput:      128788
+Speedup:                            63.64
+Index = 4
+Baseline(fork) Throughput:           2010
+Optimized(context) Throughput:      127436
+Speedup:                            63.38
+Index = 5
+Baseline(fork) Throughput:           2008
+Optimized(context) Throughput:      127885
+Speedup:                            63.66
+Index = 6
+Baseline(fork) Throughput:           2007
+Optimized(context) Throughput:      128044
+Speedup:                            63.77
+Index = 7
+Baseline(fork) Throughput:           2011
+Optimized(context) Throughput:      130253
+Speedup:                            64.75
+Index = 8
+Baseline(fork) Throughput:           2005
+Optimized(context) Throughput:      130198
+Speedup:                            64.92
+Index = 9
+Baseline(fork) Throughput:           2029
+Optimized(context) Throughput:      124177
+Speedup:                            61.20
+Index = 10
+Baseline(fork) Throughput:           2033
+Optimized(context) Throughput:      124487
+Speedup:                            61.23
+Index = 11
+Baseline(fork) Throughput:           2031
+Optimized(context) Throughput:      121317
+Speedup:                            59.73
+Index = 12
+Baseline(fork) Throughput:           2025
+Optimized(context) Throughput:      112462
+Speedup:                            55.53
+Index = 13
+Baseline(fork) Throughput:           2022
+Optimized(context) Throughput:       98054
+Speedup:                            48.49
+Index = 14
+Baseline(fork) Throughput:           2004
+Optimized(context) Throughput:       78800
+Speedup:                            39.31
+Index = 15
+Baseline(fork) Throughput:           1953
+Optimized(context) Throughput:       54117
+Speedup:                            27.71
+Index = 16
+Baseline(fork) Throughput:           1934
+Optimized(context) Throughput:       35515
+Speedup:                            18.36
+Index = 17
+Baseline(fork) Throughput:           1832
+Optimized(context) Throughput:       20555
+Speedup:                            11.22
+Index = 18
+Baseline(fork) Throughput:           1955
+Optimized(context) Throughput:       10557
+Speedup:                             5.40
+Index = 19
+Baseline(fork) Throughput:           2013
+Optimized(context) Throughput:        5382
+Speedup:                             2.67
+Index = 20
+Baseline(fork) Throughput:           1581
+Optimized(context) Throughput:        2768
+Speedup:                             1.75
+Index = 21
+Baseline(fork) Throughput:           1205
+Optimized(context) Throughput:        1391
+Speedup:                             1.15
+Index = 22
+Baseline(fork) Throughput:            844
+Optimized(context) Throughput:         715
+Speedup:                             0.85
+Index = 23
+Baseline(fork) Throughput:            399
+Optimized(context) Throughput:         233
+Speedup:                             0.59
+Index = 24
+Baseline(fork) Throughput:            266
+Optimized(context) Throughput:         141
+Speedup:                             0.53
+Index = 25
+Baseline(fork) Throughput:            159
+Optimized(context) Throughput:          79
+Speedup:                             0.50
+Index = 26
+Baseline(fork) Throughput:             88
+Optimized(context) Throughput:          42
+Speedup:                             0.48
+Index = 27
+Baseline(fork) Throughput:             49
+Optimized(context) Throughput:          21
+Speedup:                             0.44
+Index = 28
+Baseline(fork) Throughput:             30
+Optimized(context) Throughput:          10
+Speedup:                             0.33
+Index = 29
+Baseline(fork) Throughput:             19
+Optimized(context) Throughput:           5
+Speedup:                             0.25

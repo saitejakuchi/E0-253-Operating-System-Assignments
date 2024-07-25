@@ -1,0 +1,538 @@
+From 39012b262b3ebcb381ee98023a15b47617fdb580 Mon Sep 17 00:00:00 2001
+From: Teja <teja@mail.com>
+Date: Mon, 10 Apr 2023 16:10:14 +0530
+Subject: [PATCH] Assignment-2
+
+---
+ Makefile                               |   2 +-
+ arch/x86/entry/syscalls/syscall_64.tbl |   1 +
+ include/linux/mm_types.h               |  12 ++
+ include/linux/sched.h                  |   2 +-
+ include/linux/syscalls.h               |   1 +
+ kernel/exit.c                          |   3 +
+ kernel/fork.c                          |   8 +-
+ mm/memory.c                            |  64 ++++++
+ mmcontext/Makefile                     |   1 +
+ mmcontext/mmcontext.c                  | 281 +++++++++++++++++++++++++
+ mmcontext/mmcontext.h                  |  10 +
+ 11 files changed, 382 insertions(+), 3 deletions(-)
+ create mode 100644 mmcontext/Makefile
+ create mode 100644 mmcontext/mmcontext.c
+ create mode 100644 mmcontext/mmcontext.h
+
+diff --git a/Makefile b/Makefile
+index b978809a1..a7c396b0f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1101,7 +1101,7 @@ export MODORDER := $(extmod_prefix)modules.order
+ export MODULES_NSDEPS := $(extmod_prefix)modules.nsdeps
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y			+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/
++core-y			+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ mmcontext/
+ core-$(CONFIG_BLOCK)	+= block/
+ core-$(CONFIG_IO_URING)	+= io_uring/
+ 
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index c84d12608..8a0c035f3 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -415,5 +415,6 @@
+ 545	x32	execveat		compat_sys_execveat
+ 546	x32	preadv2			compat_sys_preadv64v2
+ 547	x32	pwritev2		compat_sys_pwritev64v2
++548	64	mmcontext		sys_mmcontext
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+ # not special and are not to be used for x32-specific syscalls.
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index cf97f3884..258ca8f1d 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -483,8 +483,20 @@ struct vm_area_struct {
+ } __randomize_layout;
+ 
+ struct kioctx_table;
++
++struct context_pages {
++	unsigned long addr, page_size;
++	struct context_pages *next;
++};
++
+ struct mm_struct {
+ 	struct {
++
++		struct context_pages *context_head, *context_tail;
++		struct file *context_filp;
++		loff_t context_offset;
++		unsigned long saved_page_count;
++	
+ 		struct vm_area_struct *mmap;		/* list of VMAs */
+ 		struct rb_root mm_rb;
+ 		u64 vmacache_seqnum;                   /* per-thread vmacache */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 8d82d6d32..d4b343d29 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -733,7 +733,7 @@ struct task_struct {
+ 	struct thread_info		thread_info;
+ #endif
+ 	unsigned int			__state;
+-
++	bool 				context_saved;
+ #ifdef CONFIG_PREEMPT_RT
+ 	/* saved state for "spinlock sleepers" */
+ 	unsigned int			saved_state;
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index a34b0f9a9..9472624cb 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1385,4 +1385,5 @@ int __sys_getsockopt(int fd, int level, int optname, char __user *optval,
+ 		int __user *optlen);
+ int __sys_setsockopt(int fd, int level, int optname, char __user *optval,
+ 		int optlen);
++asmlinkage int sys_mmcontext(int state);
+ #endif
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 84021b24f..c58e0161a 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -71,6 +71,8 @@
+ #include <asm/unistd.h>
+ #include <asm/mmu_context.h>
+ 
++#include "../mmcontext/mmcontext.h"
++
+ static void __unhash_process(struct task_struct *p, bool group_dead)
+ {
+ 	nr_threads--;
+@@ -740,6 +742,7 @@ void __noreturn do_exit(long code)
+ 
+ 	WARN_ON(tsk->plug);
+ 
++        remove_context_file(current);
+ 	kcov_task_exit(tsk);
+ 
+ 	coredump_task_exit(tsk);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index f925d2b96..b28cb168a 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1112,6 +1112,12 @@ static void mm_init_uprobes_state(struct mm_struct *mm)
+ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ 	struct user_namespace *user_ns)
+ {
++	mm->context_filp = NULL;
++	mm->context_head = NULL;
++	mm->context_tail = NULL;
++	mm->context_offset = 0;
++	mm->saved_page_count = 0;
++
+ 	mm->mmap = NULL;
+ 	mm->mm_rb = RB_ROOT;
+ 	mm->vmacache_seqnum = 0;
+@@ -2494,7 +2500,7 @@ static __latent_entropy struct task_struct *copy_process(
+ 	uprobe_copy_process(p, clone_flags);
+ 
+ 	copy_oom_score_adj(clone_flags, p);
+-
++	p->context_saved = false;
+ 	return p;
+ 
+ bad_fork_cancel_cgroup:
+diff --git a/mm/memory.c b/mm/memory.c
+index a0fdaa740..3bce710f5 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -4862,6 +4862,16 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ {
+ 	pte_t entry;
+ 
++	struct vm_area_struct *task_vma;
++	struct mm_struct *task_mm;
++	struct file *task_filp;
++	struct context_pages *page_data;
++
++	char *page_buff;
++	bool is_stack;
++	int retval;
++	unsigned long curr_addr;
++
+ 	if (unlikely(pmd_none(*vmf->pmd))) {
+ 		/*
+ 		 * Leave __pte_alloc() until later: because vm_ops->fault may
+@@ -4896,6 +4906,60 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 		vmf->orig_pte = *vmf->pte;
+ 		vmf->flags |= FAULT_FLAG_ORIG_PTE_VALID;
+ 
++    task_mm = current->mm;
++    task_vma = vmf->vma;
++    curr_addr = vmf->address;
++    task_filp = task_mm->context_filp;
++    is_stack = (task_vma->vm_start <= task_vma->vm_mm->start_stack &&
++                task_vma->vm_end >= task_vma->vm_mm->start_stack);
++
++    if (current->context_saved && !pte_write(vmf->orig_pte) &&
++        vma_is_anonymous(task_vma) && !is_stack) {
++
++      // Fix the Write permission for the page.
++      flush_tlb_page(task_vma, curr_addr);
++      set_pte_at(task_mm, curr_addr, vmf->pte, pte_mkwrite(*(vmf->pte)));
++
++      page_buff = (char *)kmalloc(PAGE_SIZE, GFP_KERNEL);
++      if(!page_buff) {
++        printk("Failed allocation of buffer to copy from userspace\n");
++      }
++
++      retval = copy_from_user(page_buff, (void *)curr_addr, PAGE_SIZE);
++      if(retval) {
++        printk("Failed to copy data from userspace\n");
++        goto free_memory;
++      }
++
++      retval = kernel_write(task_filp, page_buff, PAGE_SIZE, &(task_mm->context_offset));
++      if(retval != (int)PAGE_SIZE) {
++        printk("Failed to write page_data into kernel space file\n");
++        goto free_memory;
++      }
++
++      page_data = kmalloc(sizeof(struct context_pages), GFP_KERNEL);
++      if(!page_data) {
++        printk("Failed to allocate memory for context pages\n");
++        goto free_memory;
++      }
++
++      page_data->addr = curr_addr;
++      page_data->page_size = PAGE_SIZE;
++      page_data->next = NULL;
++
++      if (task_mm->context_tail != NULL) {
++          task_mm->context_tail->next = page_data;
++          task_mm->context_tail = page_data;
++      } else {
++          task_mm->context_tail = page_data;
++          task_mm->context_head = page_data;
++      }
++      
++      ++task_mm->saved_page_count;
++    }
++    free_memory:
++      kfree(page_buff);
++
+ 		/*
+ 		 * some architectures can have larger ptes than wordsize,
+ 		 * e.g.ppc44x-defconfig has CONFIG_PTE_64BIT=y and
+diff --git a/mmcontext/Makefile b/mmcontext/Makefile
+new file mode 100644
+index 000000000..0838d7fc1
+--- /dev/null
++++ b/mmcontext/Makefile
+@@ -0,0 +1 @@
++obj-y := mmcontext.o
+\ No newline at end of file
+diff --git a/mmcontext/mmcontext.c b/mmcontext/mmcontext.c
+new file mode 100644
+index 000000000..e063aebfd
+--- /dev/null
++++ b/mmcontext/mmcontext.c
+@@ -0,0 +1,281 @@
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/syscalls.h>
++
++#include "asm/pgtable.h"
++#include "asm/tlbflush.h"
++#include "linux/fs.h"
++#include "linux/gfp_types.h"
++#include "linux/mm_types.h"
++#include "linux/sched.h"
++#include "linux/types.h"
++#include "mmcontext.h"
++
++int write_page_data_to_file(struct mm_struct *task_mm, struct file *file_obj,
++                            unsigned long vaddr, unsigned long curr_page_size) {
++
++  struct context_pages *saved_page_context;
++  int retval;
++
++  char *write_buff = kmalloc(curr_page_size, GFP_KERNEL);
++
++  if (!write_buff) {
++    printk("Failed to allocate buffer of size (%ld) for reading from kernel "
++           "memory\n",
++           curr_page_size);
++    retval = -EINVAL;
++    goto out;
++  }
++
++  retval = copy_from_user(write_buff, (void *)vaddr, curr_page_size);
++  if (retval) {
++    printk("Reading from kernel address to buffer failed for size (%ld)\n, "
++           "failed to read %d bytes",
++           curr_page_size, retval);
++    retval = -EINVAL;
++    goto free_memory;
++  }
++
++  retval = kernel_write(file_obj, write_buff, curr_page_size,
++                        &(task_mm->context_offset));
++  if (retval != (int)curr_page_size) {
++    printk("Failed to write page data from buffer into kernel for size (%ld), "
++           "retval is %d",
++           curr_page_size, retval);
++    retval = -EINVAL;
++    goto free_memory;
++  }
++
++  saved_page_context = kmalloc(sizeof(struct context_pages), GFP_KERNEL);
++  if (!saved_page_context) {
++    printk("Failed to allocate struct for storing page of size (%ld)",
++           curr_page_size);
++    retval = -EINVAL;
++    goto free_memory;
++  }
++
++  saved_page_context->addr = vaddr;
++  saved_page_context->page_size = curr_page_size;
++  saved_page_context->next = NULL;
++
++  if (task_mm->context_head != NULL) {
++    task_mm->context_tail->next = saved_page_context;
++    task_mm->context_tail = saved_page_context;
++  } else {
++    task_mm->context_head = saved_page_context;
++    task_mm->context_tail = saved_page_context;
++  }
++  ++task_mm->saved_page_count;
++  retval = 0;
++
++free_memory:
++  kfree(write_buff);
++out:
++  return retval;
++}
++
++int save_pages(struct mm_struct *task_mm, struct file *file_obj) {
++  struct vm_area_struct *task_vma;
++  pgd_t *pgd;
++  p4d_t *p4d;
++  pud_t *pud;
++  pmd_t *pmd;
++  pte_t *pte;
++  int retval;
++  bool is_stack;
++  unsigned long vaddr, curr_page_size = 4096;
++
++  task_vma = task_mm->mmap;
++
++  while (task_vma != NULL) {
++    is_stack = (task_vma->vm_start <= task_vma->vm_mm->start_stack &&
++                task_vma->vm_end >= task_vma->vm_mm->start_stack);
++    if (vma_is_anonymous(task_vma) && !is_stack) {
++      vaddr = task_vma->vm_start;
++      while (vaddr < task_vma->vm_end) {
++
++        pgd = pgd_offset(task_mm, (unsigned long)vaddr);
++        if (!pgd_present(*pgd))
++          goto next;
++
++        p4d = p4d_offset(pgd, (unsigned long)vaddr);
++        if (!p4d_present(*p4d))
++          goto next;
++
++        pud = pud_offset(p4d, (unsigned long)vaddr);
++        if (!pud_present(*pud))
++          goto next;
++
++        if (pud_trans_huge(*pud)) {
++          curr_page_size = curr_page_size << 18;
++          retval =
++              write_page_data_to_file(task_mm, file_obj, vaddr, curr_page_size);
++          if (retval) {
++            printk("Error when trying to write an 1GB Page into file\n");
++            goto out;
++          }
++          goto next;
++        }
++
++        pmd = pmd_offset(pud, (unsigned long)vaddr);
++        if (!pmd_present(*pmd) || pmd_none(*pmd) || pmd_bad(*pmd))
++          goto next;
++
++        if (pmd_trans_huge(*pmd)) {
++          curr_page_size = curr_page_size << 9;
++          retval =
++              write_page_data_to_file(task_mm, file_obj, vaddr, curr_page_size);
++          if (retval) {
++            printk("Error when trying to write an 2MB Page into file\n");
++            goto out;
++          }
++          goto next;
++        }
++
++        pte = pte_offset_map(pmd, (unsigned long)vaddr);
++        if (!pte_present(*pte))
++          goto next;
++        flush_tlb_page(task_vma, vaddr);
++        set_pte_at(task_mm, vaddr, pte, pte_wrprotect(*pte));
++        // retval =
++        //     write_page_data_to_file(task_mm, file_obj, vaddr,
++        //     curr_page_size);
++        // if (retval) {
++        //   printk("Error when trying to write an 4KB Page into file\n");
++        //   goto out;
++        // }
++      next:
++        vaddr += curr_page_size;
++        curr_page_size = 4096;
++      }
++    }
++    task_vma = task_vma->vm_next;
++  }
++  retval = 0;
++out:
++  return retval;
++}
++
++SYSCALL_DEFINE1(mmcontext, int, state) {
++
++  struct task_struct *task;
++  struct mm_struct *task_mm;
++  struct file *task_filp;
++
++  char path_to_file[30];
++  int retval;
++
++  task = current;
++  task_mm = current->mm;
++  task_filp = task_mm->context_filp;
++  sprintf(path_to_file, "/tmp/context_%d", task->pid);
++
++  if (!task_filp) {
++    task_filp = filp_open(path_to_file, O_RDWR | O_CREAT, 0);
++    task_mm->context_filp = task_filp;
++  }
++
++  if (!state) {
++    if (task->context_saved) {
++      retval = -EINVAL;
++      goto out;
++    }
++
++    // So much time wasted on this. Need to keep resetting the offset here
++    // aswell or memory would blowup.
++    task_mm->context_offset = 0;
++    retval = save_pages(task_mm, task_filp);
++    if (retval)
++      goto out;
++    task->context_saved = true;
++    retval = 0;
++  } else {
++
++    if (!task->context_saved) {
++      retval = -EINVAL;
++      goto out;
++    }
++
++    retval = restore_pages(task, task_mm, task_filp);
++    if (retval)
++      goto out;
++    task->context_saved = false;
++    retval = 0;
++  }
++out:
++  return retval;
++}
++
++int restore_pages(struct task_struct *task, struct mm_struct *task_mm,
++                  struct file *task_filp) {
++
++  struct context_pages *saved_pages_data_head, *temp;
++  char *read_buff;
++  int retval;
++
++  loff_t file_offset = 0;
++  saved_pages_data_head = task_mm->context_head;
++
++  while (saved_pages_data_head != NULL) {
++
++    read_buff = kmalloc(saved_pages_data_head->page_size, GFP_KERNEL);
++    if (!read_buff) {
++      retval = -EINVAL;
++      printk("Failed to allocate buffer to read data from kernel file\n");
++      goto out;
++    }
++
++    retval = kernel_read(task_filp, (void *)read_buff, PAGE_SIZE, &file_offset);
++    if (retval != (int)(saved_pages_data_head->page_size)) {
++      retval = -EINVAL;
++      printk("Failed to read complete data into buffer\n");
++      goto free_memory;
++    }
++
++    retval = copy_to_user((void *)(saved_pages_data_head->addr), read_buff,
++                          PAGE_SIZE);
++    if (retval) {
++      retval = -EINVAL;
++      printk("Failed to copy data into userspace\n");
++      goto free_memory;
++    }
++
++    kfree(read_buff);
++
++    temp = saved_pages_data_head;
++    saved_pages_data_head = saved_pages_data_head->next;
++    kfree(temp);
++    --task->mm->saved_page_count;
++  }
++  task->mm->context_head = NULL;
++  task->mm->context_tail = NULL;
++  goto out;
++
++free_memory:
++  kfree(read_buff);
++
++out:
++  return retval;
++}
++
++void remove_context_file(struct task_struct *current_task) {
++
++  struct file *filp;
++  struct path *file_path;
++  struct inode *file_inode;
++  struct dentry *file_dentry;
++
++  if (current_task->mm != NULL) {
++    filp = current_task->mm->context_filp;
++    if (filp != NULL) {
++      file_path = &filp->f_path;
++      file_dentry = file_path->dentry;
++      file_inode = d_inode(dget_parent(file_dentry));
++      inode_lock(file_inode);
++      vfs_unlink(mnt_user_ns(file_path->mnt), file_inode, file_dentry, NULL);
++      inode_unlock(file_inode);
++      current_task->mm->context_filp = NULL;
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/mmcontext/mmcontext.h b/mmcontext/mmcontext.h
+new file mode 100644
+index 000000000..88afea751
+--- /dev/null
++++ b/mmcontext/mmcontext.h
+@@ -0,0 +1,10 @@
++#ifndef MMCONTEXT_H
++#define MMCONTEXT_H
++
++#include "linux/sched.h"
++#include "linux/types.h"
++
++int restore_pages(struct task_struct *, struct mm_struct *, struct file *);
++void remove_context_file(struct task_struct *);
++
++#endif
+-- 
+2.25.1
+
